@@ -181,7 +181,17 @@ python run_sccs_bench.py compare \
 - 逐轮：`promptTokens / completionTokens / totalTokens / estimatedContextTokens /
   contextUsageRatio / durationMs / replyChars / status / error`
 - 汇总：totals、averages、latency p50/p90/max、compactionTriggeredTurns
-  （compaction 用 `context_usage_ratio` 跨阈值近似）
+
+> **token 来源**：`/api/console/chat` 在**最后一帧** `{"object":"response",
+> "status":"completed"}` 的 `usage` 里给出 `prompt_tokens / completion_tokens /
+> total_tokens`（脚本从这帧取，不依赖 `turn_usage` 事件——该 HTTP 路径不发此事件）。
+> reply 文本从同一帧的 `output` 里向后找 `type=="message"` 的消息提取（跳过
+> reasoning / function_call）。
+>
+> **本路径拿不到的指标**：`estimatedContextTokens` 与 `contextUsageRatio` 只在
+> `turn_usage` 事件里才有，`/console/chat` 不提供，故这两列恒为 0。
+> `compactionTriggeredTurns` 改用 **`promptTokens` 相对上一轮骤降 >30%** 近似判定
+> （工具结果压缩的可观测量就是上下文/prompt token 的下降）。
 
 `bench-results-*` 是本地运行产物，不需要提交。
 

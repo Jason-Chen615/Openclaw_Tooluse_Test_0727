@@ -83,21 +83,41 @@ def parse_sse_line(line: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _message_text(msg: Dict[str, Any]) -> str:
+    """Concatenate the text blocks of one message dict."""
+    parts = []
+    for item in msg.get("content") or []:
+        if isinstance(item, dict) and item.get("type") == "text":
+            text = item.get("text") or ""
+            if text:
+                parts.append(text)
+    return "".join(parts)
+
+
 def extract_text_content(response_data: Dict[str, Any]) -> str:
-    """Extract concatenated text from output[-1].content[*].text."""
-    try:
-        output = response_data.get("output", [])
-        if not output:
-            return ""
-        last_msg = output[-1]
-        content = last_msg.get("content", [])
-        text_parts = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                text_parts.append(item.get("text", ""))
-        return "\n".join(text_parts).strip()
-    except (KeyError, IndexError, TypeError):
+    """Extract the assistant reply text from a completed `response` frame.
+
+    `response.output` is a list of messages ordered like
+    ``[reasoning, message, ...]`` (tool turns also interleave
+    ``function_call`` / ``function_call_output`` messages). The naive
+    ``output[-1]`` often lands on a reasoning or tool message with no text,
+    so we search backwards for the last ``type == "message"`` entry that
+    actually carries text — mirroring QwenPaw's own ``_response_to_text``.
+    """
+    if not isinstance(response_data, dict):
         return ""
+    output = response_data.get("output") or []
+    if not isinstance(output, list):
+        return ""
+    for msg in reversed(output):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("type") != "message":
+            continue
+        text = _message_text(msg)
+        if text.strip():
+            return text.strip()
+    return ""
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -144,7 +164,8 @@ def run_single_turn(
 
     start_time = time.time()
     turn_usage = None
-    last_response = None
+    response_final = None       # last object=="response" && status=="completed"
+    msg_text_parts: List[str] = []  # fallback: completed message frames
     error_msg = ""
 
     try:
@@ -157,10 +178,28 @@ def run_single_turn(
                     parsed = parse_sse_line(line)
                     if not parsed:
                         continue
+                    # Defensive: some paths may emit a standalone turn_usage
+                    # frame. If present it overrides response.usage.
                     if parsed.get("type") == "turn_usage":
                         turn_usage = parsed
-                    else:
-                        last_response = parsed
+                        continue
+                    obj = parsed.get("object")
+                    status = parsed.get("status")
+                    # The authoritative frame: carries both `output` and
+                    # `usage`. Only the completed one has real token counts
+                    # (created/in_progress frames have usage=null).
+                    if obj == "response" and status == "completed":
+                        response_final = parsed
+                    # Fallback text source: completed assistant message frames
+                    # (type=="message", not reasoning/function_call).
+                    elif (
+                        obj == "message"
+                        and status == "completed"
+                        and parsed.get("type") == "message"
+                    ):
+                        text = _message_text(parsed)
+                        if text.strip():
+                            msg_text_parts.append(text.strip())
     except httpx.HTTPStatusError as e:
         error_msg = f"HTTP {e.response.status_code}: {e.response.text[:200]}"
     except Exception as e:
@@ -168,17 +207,23 @@ def run_single_turn(
 
     duration_ms = int((time.time() - start_time) * 1000)
 
-    # Extract usage
-    usage = (turn_usage or {}).get("usage") or {}
-    context_usage = (turn_usage or {}).get("context_usage") or {}
+    # Extract usage: prefer standalone turn_usage frame (if any), else the
+    # completed response frame's `usage` (the real source on /console/chat).
+    usage = (turn_usage or {}).get("usage") or (response_final or {}).get("usage") or {}
     prompt_tokens = usage.get("prompt_tokens") or 0
     completion_tokens = usage.get("completion_tokens") or 0
     total_tokens = usage.get("total_tokens") or 0
+    # context_usage only exists on the turn_usage path (absent on
+    # /console/chat), so these stay 0 there — see README note.
+    context_usage = (turn_usage or {}).get("context_usage") or {}
     estimated_tokens = context_usage.get("estimated_tokens") or 0
     context_usage_ratio = context_usage.get("context_usage_ratio") or 0.0
 
-    # Extract reply text
-    reply_text = extract_text_content(last_response or {})
+    # Extract reply text from the completed response frame; fall back to
+    # accumulated completed-message frames.
+    reply_text = extract_text_content(response_final or {})
+    if not reply_text and msg_text_parts:
+        reply_text = "\n".join(msg_text_parts).strip()
 
     return {
         "durationMs": duration_ms,
@@ -255,7 +300,7 @@ def run_bench(args: argparse.Namespace) -> None:
 
     started_at = datetime.now().isoformat()
     rows = []
-    prev_context_ratio = 0.0
+    prev_prompt_tokens = 0
 
     print(f"[sccs-bench] started at {started_at}")
     print(f"[sccs-bench] prompts: {args.prompts} ({len(prompts)} turns)")
@@ -276,11 +321,20 @@ def run_bench(args: argparse.Namespace) -> None:
             auth_token=auth_token,
         )
 
-        # Detect compaction: when context_usage_ratio jumps down significantly
+        # Detect likely compaction: prompt (context) tokens drop sharply vs
+        # the previous turn despite accumulating history. On /console/chat we
+        # have no context_usage_ratio, so promptTokens is the observable proxy
+        # for tool-result / context pruning. Threshold: >30% drop.
         compaction_delta = 0
-        if i > 0 and prev_context_ratio > 0.7 and result["contextUsageRatio"] < 0.5:
+        cur_prompt = result["promptTokens"]
+        if (
+            i > 0
+            and prev_prompt_tokens > 0
+            and cur_prompt > 0
+            and cur_prompt < prev_prompt_tokens * 0.7
+        ):
             compaction_delta = 1
-        prev_context_ratio = result["contextUsageRatio"]
+        prev_prompt_tokens = cur_prompt
 
         row = {
             "turn": turn_num,
