@@ -102,20 +102,38 @@ python run_sccs_bench.py run \
 
 ## 用例间重置记忆
 
-每个用例开始前重置 QwenPaw 原生记忆，保证干净起点：
+每个用例开始前重置 QwenPaw 原生记忆，保证干净起点。`reset_memory.py` 有两种模式：
+
+### docker 模式（QwenPaw 跑在容器里，推荐）
+
+QwenPaw 容器把记忆放在数据卷（如 `qwenpaw-data → /app/working`），host 上不便直接删，
+用 `--docker <容器名>`，脚本 `docker exec` 进容器删：
 
 ```bash
-# 先预览会删除哪些目录
-python reset_memory.py --agent default --dry-run
+# 先预览会删除哪些目录（不真删）
+python reset_memory.py --agent default --docker qwenpaw --dry-run
 # 实际删除
-python reset_memory.py --agent default
+python reset_memory.py --agent default --docker qwenpaw
 ```
 
-`reset_memory.py` 会定位 `<WORKING_DIR>/workspaces/<agent>` 并删除 ReMe Light 记忆子目录
-（`memory/ digest/ mem_metadata/ mem_session/ mem_agent/ resource/`，会读 agent.json 覆盖默认名）。
-安全约束：只删除 WORKING_DIR 之内的目录。
+删除的是容器内 `/app/working/workspaces/<agent>/` 下的记忆子目录。若容器内 WORKING_DIR
+不是 `/app/working`，用 `--container-working-dir` 覆盖。
 
-`WORKING_DIR` 解析：`--working-dir` > `QWENPAW_WORKING_DIR` 环境变量 > `~/.copaw`（存在时）> `~/.qwenpaw`。
+### host 模式（本机能直接访问 WORKING_DIR 时）
+
+```bash
+python reset_memory.py --agent default --dry-run
+python reset_memory.py --agent default
+# 或指向 docker 数据卷 host 路径（需 root）：
+python reset_memory.py --agent default \
+  --working-dir /var/lib/docker/volumes/qwenpaw-data/_data
+```
+
+两种模式都删除 ReMe Light 记忆子目录
+（`memory/ digest/ mem_metadata/ mem_session/ mem_agent/ resource/`，会读 agent.json 覆盖默认名），
+且**只删除 agent workspace 之内**的目录。
+
+`WORKING_DIR`（host 模式）解析：`--working-dir` > `QWENPAW_WORKING_DIR` 环境变量 > `~/.copaw`（存在时）> `~/.qwenpaw`。
 
 ## 批量运行示例
 
@@ -129,11 +147,12 @@ export BENCH_WORKSPACE_ROOT="${BENCH_WORKSPACE_ROOT:-/root/.openclaw/workspace}"
 # export QWENPAW_USERNAME=your_username
 # export QWENPAW_PASSWORD=your_password
 AGENT="default"
+DOCKER_CONTAINER="qwenpaw"   # QwenPaw 容器名；若在 host 直跑，删掉下面 --docker 参数
 OUT_ROOT="bench-results"
 
 run_case() {
   local name="$1"
-  python reset_memory.py --agent "$AGENT"
+  python reset_memory.py --agent "$AGENT" --docker "$DOCKER_CONTAINER"
   python run_sccs_bench.py run \
     --prompts "${name}.json" \
     --label "$name" \
